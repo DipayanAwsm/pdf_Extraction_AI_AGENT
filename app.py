@@ -85,17 +85,29 @@ def load_config(config_file: str = "config.py") -> Dict[str, str]:
 
 def setup_openai_client(cfg: Dict[str, str]):
     """Setup OpenAI client based on configuration"""
+    if not cfg:
+        return None
+    
     try:
-        if cfg['use_azure']:
+        if cfg.get('use_azure'):
+            # Validate Azure OpenAI settings
+            if not all([cfg.get('azure_api_key'), cfg.get('azure_endpoint'), cfg.get('azure_deployment')]):
+                return None
+            
             client = OpenAI(
                 api_key=cfg['azure_api_key'],
                 base_url=f"{cfg['azure_endpoint'].rstrip('/')}/openai/deployments/{cfg['azure_deployment']}",
             )
             return client
         else:
+            # Validate OpenAI settings
+            if not cfg.get('openai_api_key'):
+                return None
+            
             client = OpenAI(api_key=cfg['openai_api_key'])
             return client
-    except Exception:
+    except Exception as e:
+        st.error(f"Error setting up OpenAI client: {e}")
         return None
 
 
@@ -696,6 +708,12 @@ def main():
         </div>
     """, unsafe_allow_html=True)
     
+    # Load config at the start - available to both tabs
+    if 'app_config' not in st.session_state:
+        st.session_state['app_config'] = load_config()
+    
+    cfg = st.session_state.get('app_config')
+    
     # Tabs for different functionalities
     tab1, tab2 = st.tabs(["📤 PDF Parser", "🤖 AI Agent"])
     
@@ -708,9 +726,6 @@ def main():
         # Sidebar for configuration
         st.sidebar.header("⚙️ Configuration")
         
-        # Try to load config from file
-        cfg = load_config()
-        
         if cfg:
             st.sidebar.success("✅ Config loaded from config.py")
             use_config_file = st.sidebar.checkbox("Use config.py settings", value=True)
@@ -720,31 +735,58 @@ def main():
                 st.write(f"**Extractor Engine:** {cfg.get('extractor_engine', 'claude')}")
                 st.write(f"**Max Chunk Size:** {cfg.get('max_chunk_size', 15000)}")
                 st.write(f"**API Delay:** {cfg.get('api_delay', 1)}s")
+                
+                # Show Azure OpenAI info if configured
+                if cfg.get('use_azure'):
+                    st.write(f"**Provider:** Azure OpenAI")
+                    st.write(f"**Azure Endpoint:** {cfg.get('azure_endpoint', 'N/A')[:50]}...")
+                    st.write(f"**Deployment:** {cfg.get('azure_deployment', 'N/A')}")
+                elif cfg.get('openai_api_key'):
+                    st.write(f"**Provider:** OpenAI")
+                    st.write(f"**OpenAI Model:** {cfg.get('openai_model', 'N/A')}")
+                
+                # Show AWS/Claude info if configured
                 if cfg.get('aws_access_key'):
                     st.write(f"**AWS Region:** {cfg.get('aws_region', 'us-east-1')}")
                     st.write(f"**Claude Model:** {cfg.get('model_id', 'N/A')}")
-                if cfg.get('openai_api_key'):
-                    st.write(f"**OpenAI Model:** {cfg.get('openai_model', 'N/A')}")
         else:
             use_config_file = False
             st.sidebar.info("No config.py found. Enter API keys below.")
         
-        if not use_config_file:
+        # Allow override only if user explicitly unchecks the config file option
+        if not use_config_file or not cfg:
             st.sidebar.subheader("API Settings")
-            use_azure = st.sidebar.checkbox("Use Azure OpenAI", value=False)
+            use_azure = st.sidebar.checkbox("Use Azure OpenAI", value=cfg.get('use_azure', False) if cfg else False)
             
             if use_azure:
-                azure_endpoint = st.sidebar.text_input("Azure Endpoint", type="password")
-                azure_api_key = st.sidebar.text_input("Azure API Key", type="password")
-                azure_deployment = st.sidebar.text_input("Azure Deployment Name")
+                azure_endpoint = st.sidebar.text_input(
+                    "Azure Endpoint", 
+                    value=cfg.get('azure_endpoint', '') if cfg else '',
+                    type="default"
+                )
+                azure_api_key = st.sidebar.text_input(
+                    "Azure API Key", 
+                    value=cfg.get('azure_api_key', '') if cfg else '',
+                    type="password"
+                )
+                azure_deployment = st.sidebar.text_input(
+                    "Azure Deployment Name",
+                    value=cfg.get('azure_deployment', '') if cfg else ''
+                )
                 cfg = {
                     'use_azure': True,
                     'azure_endpoint': azure_endpoint,
                     'azure_api_key': azure_api_key,
                     'azure_deployment': azure_deployment,
+                    'max_chunk_size': cfg.get('max_chunk_size', 15000) if cfg else 15000,
+                    'api_delay': cfg.get('api_delay', 0.3) if cfg else 0.3,
                 }
             else:
-                openai_api_key = st.sidebar.text_input("OpenAI API Key", type="password")
+                openai_api_key = st.sidebar.text_input(
+                    "OpenAI API Key", 
+                    value=cfg.get('openai_api_key', '') if cfg else '',
+                    type="password"
+                )
                 openai_model = st.sidebar.selectbox(
                     "Model",
                     ["gpt-4o-2024-08-06", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
@@ -754,7 +796,15 @@ def main():
                     'use_azure': False,
                     'openai_api_key': openai_api_key,
                     'openai_model': openai_model,
+                    'max_chunk_size': cfg.get('max_chunk_size', 15000) if cfg else 15000,
+                    'api_delay': cfg.get('api_delay', 0.3) if cfg else 0.3,
                 }
+            
+            # Update session state with new config
+            st.session_state['app_config'] = cfg
+        else:
+            # Ensure session state is updated with loaded config
+            st.session_state['app_config'] = cfg
         
         # File uploader
         st.header("📤 Upload PDF Files")
@@ -914,6 +964,18 @@ def main():
     with tab2:
         st.header("🤖 AI Claims Document Agent")
         st.markdown("Search for loss run reports using natural language, preview documents, send emails, and parse PDFs.")
+        
+        # Show config status
+        app_cfg = st.session_state.get('app_config')
+        if app_cfg:
+            if app_cfg.get('use_azure'):
+                st.info(f"✅ Using Azure OpenAI - Deployment: {app_cfg.get('azure_deployment', 'N/A')}")
+            elif app_cfg.get('openai_api_key'):
+                st.info(f"✅ Using OpenAI - Model: {app_cfg.get('openai_model', 'N/A')}")
+            else:
+                st.warning("⚠️ No OpenAI configuration found. Configure in Tab 1 or create config.py")
+        else:
+            st.warning("⚠️ No configuration found. Please configure in Tab 1 or create config.py")
         
         # Import the agent module dynamically
         try:
@@ -1224,17 +1286,18 @@ Rules:
                                 parse_progress.progress((idx + 1) / total_files)
                                 continue
                             
-                            # Use existing OpenAI config
-                            if cfg:
-                                client = setup_openai_client(cfg)
+                            # Use config from session state (shared with Tab 1)
+                            app_cfg = st.session_state.get('app_config')
+                            if app_cfg:
+                                client = setup_openai_client(app_cfg)
                                 if client:
                                     parse_placeholder.info(f"🤖 AI analyzing {f.get('filename')}...")
-                                    model = cfg.get('azure_deployment') if cfg.get('use_azure') else cfg.get('openai_model', 'gpt-4o-2024-08-06')
+                                    model = app_cfg.get('azure_deployment') if app_cfg.get('use_azure') else app_cfg.get('openai_model', 'gpt-4o-2024-08-06')
                                     
                                     lobs = classify_lobs_multi_openai(client, model, text)
                                     results = []
-                                    max_chunk_size = cfg.get('max_chunk_size', 15000)
-                                    api_delay = cfg.get('api_delay', 0.3)
+                                    max_chunk_size = app_cfg.get('max_chunk_size', 15000)
+                                    api_delay = app_cfg.get('api_delay', 0.3)
                                     for lob in lobs:
                                         parse_placeholder.info(f"📊 Extracting {lob} claims from {f.get('filename')}...")
                                         fields = extract_fields_openai_chunked(client, model, text, lob, None, max_chunk_size, api_delay)
@@ -1252,9 +1315,9 @@ Rules:
                                         "results": results
                                     })
                                 else:
-                                    parse_results.append({"filename": f.get('filename'), "error": "No OpenAI client"})
+                                    parse_results.append({"filename": f.get('filename'), "error": "Failed to setup OpenAI client. Check config.py settings."})
                             else:
-                                parse_results.append({"filename": f.get('filename'), "error": "No config.py found"})
+                                parse_results.append({"filename": f.get('filename'), "error": "No config found. Please configure in Tab 1 or create config.py"})
                                 
                         except Exception as e:
                             parse_results.append({"filename": f.get('filename'), "error": str(e)})
