@@ -1,0 +1,189 @@
+Agentic AI for Loss Run Processing - Use Case Overview
+======================================================
+
+1. Business Context
+-------------------
+You receive loss run PDFs from multiple carriers (AUTO, GL, WC, PROPERTY).
+Each PDF can be:
+- Text-based, table-based, scanned images, or a mix
+- Multi-page, inconsistent, and messy
+You want to extract structured claim data into Excel with minimal manual work.
+
+Today, the pipeline is:
+- PDF -> Text (fitz / OCR) -> LLM extraction (Claude/OpenAI) -> Excel
+This works, but:
+- You manually choose which script/strategy to run
+- Errors (bad PDFs, timeouts, weird formats) require manual debugging
+- Quality checks and re-runs are manual
+
+Agentic AI adds an intelligent “orchestrator” on top of this pipeline.
+
+2. What Is Agentic AI Here?
+---------------------------
+In this project, “agentic AI” means:
+- An AI component that:
+  - Analyzes each input PDF
+  - Decides which extraction strategy to use
+  - Monitors each step
+  - Recovers from errors automatically when possible
+  - Validates the output and flags issues
+  - Learns from past runs to improve future decisions
+
+It is NOT just “calling an LLM once”.
+It is using LLM(s) + rules + tools to drive a multi-step process end-to-end.
+
+3. High-Level Agent Flow
+------------------------
+For each PDF:
+1) Analyze document
+   - Count pages, estimate structure (text vs tables vs scanned)
+   - Detect if tables are present
+   - Estimate complexity (pages, size)
+
+2) Select strategy
+   - If mostly tables -> use Camelot/Tabula first
+   - If mostly narrative text -> use LLM text extractor
+   - If scanned -> run OCR first, then LLM
+   - If mixed/unknown -> use adaptive multi-strategy
+
+3) Execute with monitoring
+   - Run the selected extractor(s)
+   - Capture logs and timings
+   - If a step fails, try a fallback strategy automatically
+
+4) Validate output
+   - Check for:
+     - Missing claim numbers
+     - Obvious amount format issues
+     - Suspicious date formats
+   - Produce a “data quality score” and a list of issues
+
+5) Auto-correct simple issues
+   - Normalize amount formats (e.g. remove extra symbols)
+   - Normalize date strings where possible
+
+6) Learn from result
+   - Record which strategy worked best for this carrier / document type
+   - Record common errors and how they were fixed
+   - Next time, prefer strategies that have worked well historically
+
+7) Produce final artifacts
+   - Excel files (with timestamp + original filename)
+   - Summary JSON/CSV of:
+     - Chosen strategy
+     - Processing time
+     - Quality score
+     - Issues found / fixed
+
+4. Concrete Example
+-------------------
+Example: You drop “StateFarm_Auto_LossRun_2024.pdf” into the system.
+
+Without agent:
+- You manually run a shell script or Streamlit flow.
+- If LLM times out, you debug logs and re-run with different settings.
+- If output looks wrong, you manually re-run with another tool (e.g. Camelot).
+
+With agentic AI:
+1) Agent analyzes the PDF:
+   - 35 pages, mostly text with some embedded tables
+   - Structure: mixed_tables_and_text
+   - Complexity: high
+
+2) Agent decides:
+   - Strategy: “adaptive_multi”
+   - Confidence: 0.82
+   - Reasoning: “Mixed structure, high complexity; will use text LLM + table fallback”
+
+3) Agent runs:
+   - First pass: text_lob_openai_extractor on full text
+   - If coverage on table-like pages is low, agent calls Camelot/Tabula on those pages and merges results
+
+4) Agent validates:
+   - Finds 7 rows with missing claim numbers and 3 with strange amount formats
+   - Auto-corrects amount formats
+   - Flags missing claim numbers as “needs review”
+
+5) Agent learns:
+   - Records that for this carrier and structure, “adaptive_multi” with OpenAI performed well
+   - Next similar State Farm AUTO loss run will start with this strategy
+
+6) Output:
+   - Excel: StateFarm_Auto_LossRun_2024_20241127_173012_result.xlsx
+   - JSON summary:
+     - strategy_used: adaptive_multi
+     - lob_detected: [AUTO]
+     - claims_count: 124
+     - quality_score: 0.93
+     - issues_flagged: 7
+
+5. Where It Fits in Your Codebase
+---------------------------------
+Agentic AI can sit “on top of” your existing tools:
+- It calls:
+  - fitzTest3.py or internal fitz text extraction
+  - text_lob_llm_extractor.py (Claude)
+  - text_lob_openai_extractor.py (OpenAI)
+  - adaptive_table_extractor_standalone.py
+  - camelot/tabula extractors
+
+You already have:
+- Robust text extraction (fitz, pdfplumber + OCR)
+- Multiple extractors (Claude, OpenAI, Camelot, Tabula)
+- Streamlit E2E apps
+
+The agent becomes:
+- A Python “brain” (like agentic_processor.py) that:
+  - Chooses which script to run
+  - Passes parameters
+  - Reads outputs
+  - Makes decisions about what to do next
+
+6. Benefits for Your Workflow
+-----------------------------
+1) Less manual decision-making
+   - No need to decide “Should I use Claude or OpenAI or Camelot?” each time.
+
+2) More robust automation
+   - Automatic retries and fallbacks when something fails.
+
+3) Better data quality
+   - Built-in validation and simple auto-corrections.
+
+4) Continuous improvement
+   - The system learns which strategies work best by carrier, format, and LOB.
+
+5) Better observability
+   - Rich logs, timing, quality scores, and strategy history per run.
+
+7. How to Start (Practical Steps)
+---------------------------------
+1) Start with a small “strategy agent”:
+   - Input: basic analysis (pages, size, has_tables, scanned vs text)
+   - Output: which extractor to run first (Claude / OpenAI / Camelot/Tabula).
+
+2) Add “error recovery agent”:
+   - If first extractor fails, agent automatically chooses next best one.
+
+3) Add “validation agent”:
+   - After extraction, run simple checks and flag obvious issues.
+
+4) Gradually evolve into a full agent:
+   - Add learning component (store per-run stats and decisions).
+   - Use LLM to help reason about failures and next actions if you want more autonomy.
+
+8. Summary
+----------
+Agentic AI in this project is not about replacing your existing scripts.
+It is about:
+- Wrapping them in an intelligent controller
+- Automating choices, retries, and validation
+- Learning over time which paths work best
+
+End result:
+- More reliable, self-correcting, and smarter loss run processing
+- Less manual babysitting of scripts
+- Higher data quality with clear traceability of decisions.
+
+
+
