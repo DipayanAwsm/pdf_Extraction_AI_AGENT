@@ -166,6 +166,147 @@ def scan_local_pdfs(base_dir: str = "mock_documents") -> List[Dict[str, str]]:
 
 
 # ============================================================================
+# LLM-Powered Search Functions
+# ============================================================================
+
+def extract_search_criteria_with_llm(client, model: str, query: str, available_pdfs: List[Dict]) -> Dict:
+    """
+    Use LLM to extract search criteria from natural language query
+    """
+    # Get unique values from available PDFs for context
+    unique_accounts = sorted(set(pdf['account'] for pdf in available_pdfs))
+    unique_lobs = sorted(set(pdf['lob'] for pdf in available_pdfs))
+    
+    prompt = f"""Extract search criteria from the user's natural language query.
+
+Available Accounts: {', '.join(unique_accounts)}
+Available LOBs: {', '.join(unique_lobs)}
+
+User Query: "{query}"
+
+Extract the following information:
+1. LOB (Line of Business): AUTO, PROPERTY, GL, WC, or empty if not specified
+2. Account name: Match to one of the available accounts, or empty if not specified
+3. Policy number: Any numeric identifier mentioned, or empty if not specified
+4. Keywords: Important keywords from the query (e.g., "auto", "vehicle", "claim", etc.)
+
+Return STRICT JSON ONLY with no markdown, no code blocks, no explanation:
+{{
+    "lob": "AUTO|PROPERTY|GL|WC|",
+    "account": "account name or empty string",
+    "policy_number": "policy number or empty string",
+    "keywords": ["keyword1", "keyword2"]
+}}
+
+Examples:
+- Query: "auto" → {{"lob": "AUTO", "account": "", "policy_number": "", "keywords": ["auto"]}}
+- Query: "find WC documents" → {{"lob": "WC", "account": "", "policy_number": "", "keywords": ["WC", "documents"]}}
+- Query: "Chubbs property" → {{"lob": "PROPERTY", "account": "Chubbs", "policy_number": "", "keywords": ["Chubbs", "property"]}}
+- Query: "policy 7890" → {{"lob": "", "account": "", "policy_number": "7890", "keywords": ["policy", "7890"]}}
+"""
+    
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=300,
+            response_format={"type": "json_object"}
+        )
+        
+        content = resp.choices[0].message.content
+        criteria = json.loads(content)
+        
+        # Normalize LOB
+        if criteria.get('lob'):
+            lob = criteria['lob'].upper().strip()
+            if lob in ['AUTO', 'PROPERTY', 'GL', 'GENERAL LIABILITY', 'WC', 'WORKERS COMP']:
+                if lob == 'GENERAL LIABILITY':
+                    criteria['lob'] = 'GL'
+                elif lob == 'WORKERS COMP':
+                    criteria['lob'] = 'WC'
+                else:
+                    criteria['lob'] = lob
+            else:
+                criteria['lob'] = ''
+        
+        # Normalize account (fuzzy match)
+        if criteria.get('account'):
+            account_query = criteria['account'].lower().strip()
+            for account in unique_accounts:
+                if account_query in account.lower() or account.lower() in account_query:
+                    criteria['account'] = account
+                    break
+        
+        return criteria
+    
+    except Exception as e:
+        st.warning(f"LLM search extraction failed: {e}. Using keyword matching instead.")
+        # Fallback: simple keyword matching
+        query_lower = query.lower()
+        criteria = {
+            'lob': '',
+            'account': '',
+            'policy_number': '',
+            'keywords': query_lower.split()
+        }
+        
+        # Simple LOB detection
+        if any(kw in query_lower for kw in ['auto', 'vehicle', 'car', 'automobile']):
+            criteria['lob'] = 'AUTO'
+        elif any(kw in query_lower for kw in ['property', 'dwelling', 'building', 'fire']):
+            criteria['lob'] = 'PROPERTY'
+        elif any(kw in query_lower for kw in ['gl', 'general liability', 'liability']):
+            criteria['lob'] = 'GL'
+        elif any(kw in query_lower for kw in ['wc', 'workers comp', 'workers compensation', 'work']):
+            criteria['lob'] = 'WC'
+        
+        return criteria
+
+
+def filter_pdfs_by_criteria(pdf_files: List[Dict], criteria: Dict) -> List[Dict]:
+    """
+    Filter PDF files based on search criteria
+    """
+    filtered = []
+    
+    for pdf in pdf_files:
+        match = True
+        
+        # Filter by LOB
+        if criteria.get('lob'):
+            if pdf['lob'].upper() != criteria['lob'].upper():
+                match = False
+        
+        # Filter by Account
+        if match and criteria.get('account'):
+            if pdf['account'].lower() != criteria['account'].lower():
+                match = False
+        
+        # Filter by Policy Number
+        if match and criteria.get('policy_number'):
+            policy_query = criteria['policy_number'].strip()
+            if policy_query not in pdf['policy_number']:
+                match = False
+        
+        # Filter by Keywords (in filename or other fields)
+        if match and criteria.get('keywords'):
+            pdf_text = f"{pdf['filename']} {pdf['account']} {pdf['lob']} {pdf['policy_number']}".lower()
+            keyword_match = any(
+                keyword.lower() in pdf_text 
+                for keyword in criteria['keywords']
+                if keyword.strip()
+            )
+            if not keyword_match:
+                match = False
+        
+        if match:
+            filtered.append(pdf)
+    
+    return filtered
+
+
+# ============================================================================
 # PDF Processing Functions (from streamlit_e2e_openai_app.py)
 # ============================================================================
 
@@ -526,9 +667,9 @@ def main():
     model = cfg.get('azure_deployment') if cfg.get('use_azure') else cfg.get('openai_model', 'gpt-4o-2024-08-06')
     
     # ========================================================================
-    # Section 1: Scan and Display All PDFs
+    # Section 1: Search Documents using LLM
     # ========================================================================
-    st.header("📁 Available PDFs (Local File Structure)")
+    st.header("🔍 Search Documents")
     
     # Automatically scan for PDFs on page load
     # Store in session state to avoid re-scanning on every rerun
@@ -536,19 +677,84 @@ def main():
         with st.spinner("🔍 Scanning for PDF files..."):
             st.session_state['pdf_files'] = scan_local_pdfs("mock_documents")
     
-    pdf_files = st.session_state['pdf_files']
+    all_pdf_files = st.session_state['pdf_files']
     
-    # Refresh button to re-scan
+    # Search interface
+    col_search, col_clear = st.columns([4, 1])
+    
+    with col_search:
+        search_query = st.text_input(
+            "Search documents (e.g., 'auto', 'find WC documents', 'Chubbs property', 'policy 1234')",
+            value=st.session_state.get('search_query', ''),
+            placeholder="Type your search query here...",
+            help="Use natural language to search. Examples: 'auto', 'WC', 'Chubbs', 'property claims', 'policy 7890'"
+        )
+    
+    with col_clear:
+        st.write("")  # Spacing
+        if st.button("🗑️ Clear"):
+            st.session_state['search_query'] = ''
+            st.session_state['filtered_pdfs'] = None
+            st.rerun()
+    
+    # Process search query with LLM
+    filtered_pdfs = st.session_state.get('filtered_pdfs')
+    
+    if search_query:
+        if st.button("🔎 Search", type="primary") or st.session_state.get('search_query') != search_query:
+            st.session_state['search_query'] = search_query
+            
+            with st.spinner("🤖 Analyzing search query with AI..."):
+                # Use LLM to extract search criteria
+                search_criteria = extract_search_criteria_with_llm(client, model, search_query, all_pdf_files)
+                
+                # Filter PDFs based on criteria
+                filtered_pdfs = filter_pdfs_by_criteria(all_pdf_files, search_criteria)
+                st.session_state['filtered_pdfs'] = filtered_pdfs
+                st.session_state['search_criteria'] = search_criteria
+    
+    # Display search results or all PDFs
+    if filtered_pdfs is not None:
+        pdf_files = filtered_pdfs
+        search_criteria = st.session_state.get('search_criteria', {})
+        
+        if search_criteria:
+            st.success(f"✅ Found {len(pdf_files)} document(s) matching your search")
+            with st.expander("🔍 Search Criteria (click to see)", expanded=False):
+                criteria_text = []
+                if search_criteria.get('lob'):
+                    criteria_text.append(f"**LOB:** {search_criteria['lob']}")
+                if search_criteria.get('account'):
+                    criteria_text.append(f"**Account:** {search_criteria['account']}")
+                if search_criteria.get('policy_number'):
+                    criteria_text.append(f"**Policy:** {search_criteria['policy_number']}")
+                if search_criteria.get('keywords'):
+                    criteria_text.append(f"**Keywords:** {', '.join(search_criteria['keywords'])}")
+                st.markdown(" | ".join(criteria_text) if criteria_text else "No specific criteria")
+    else:
+        pdf_files = all_pdf_files
+    
+    # Refresh button
     col_refresh, col_count = st.columns([1, 4])
     with col_refresh:
         if st.button("🔄 Refresh PDF List"):
             with st.spinner("🔍 Scanning for PDF files..."):
                 st.session_state['pdf_files'] = scan_local_pdfs("mock_documents")
-                pdf_files = st.session_state['pdf_files']
+                all_pdf_files = st.session_state['pdf_files']
+                # Re-apply search if active
+                if search_query:
+                    search_criteria = extract_search_criteria_with_llm(client, model, search_query, all_pdf_files)
+                    filtered_pdfs = filter_pdfs_by_criteria(all_pdf_files, search_criteria)
+                    st.session_state['filtered_pdfs'] = filtered_pdfs
+                else:
+                    st.session_state['filtered_pdfs'] = None
             st.rerun()
     with col_count:
         if pdf_files:
-            st.info(f"📊 Found {len(pdf_files)} PDF file(s) in local structure")
+            if filtered_pdfs is not None:
+                st.info(f"📊 Showing {len(pdf_files)} of {len(all_pdf_files)} PDF file(s)")
+            else:
+                st.info(f"📊 Found {len(pdf_files)} PDF file(s) in local structure")
     
     if not pdf_files:
         st.warning("⚠️ No PDFs found in mock_documents directory. Please ensure the directory structure is correct.")
