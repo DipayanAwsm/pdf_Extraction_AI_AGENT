@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import tempfile
 import shutil
+import io
 
 import pandas as pd
 import streamlit as st
@@ -193,16 +194,189 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     return "\n".join(text_content)
 
 
+def _chunk_text(text: str, max_chars: int = 15000, overlap_chars: int = 800) -> List[str]:
+    """Split text into chunks for processing"""
+    chunks: List[str] = []
+    if not text:
+        return chunks
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(start + max_chars, n)
+        if end < n:
+            nl = text.rfind("\n", start, end)
+            if nl != -1 and nl > start + 1000:
+                end = nl
+        chunks.append(text[start:end])
+        if end >= n:
+            break
+        start = max(0, end - overlap_chars)
+    return chunks
+
+
+def classify_lobs_multi_openai(client, model: str, text: str) -> List[str]:
+    """Classify Lines of Business from text content"""
+    prompt = f"""
+You are an insurance domain expert. Determine ALL Lines of Business (LoBs) present in the content.
+Choose any that apply from exactly these values: AUTO, GENERAL LIABILITY, WC, PROPERTY.
+Return STRICT JSON ONLY with no commentary and no markdown. Use double quotes and valid JSON.
+Schema: {{"lobs": ["AUTO"|"GENERAL LIABILITY"|"WC"|"PROPERTY", ...]}}
+Content:\n{text[:10000]}
+"""
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=500,
+            response_format={"type": "json_object"}
+        )
+        content = resp.choices[0].message.content
+        obj = json.loads(content)
+        lobs = obj.get('lobs') or []
+        out = []
+        for v in lobs:
+            s = str(v).strip().upper()
+            if s in {"AUTO", "GENERAL LIABILITY", "WC", "PROPERTY"} and s not in out:
+                out.append(s)
+        if out:
+            return out
+    except Exception:
+        pass
+    
+    # Fallback heuristic
+    t = text.upper()
+    found = []
+    if any(k in t for k in [" AUTO ", " AUTOMOBILE", " VEHICLE", " VIN ", " COLLISION", " COMPREHENSIVE", " LICENSE PLATE"]):
+        found.append("AUTO")
+    if any(k in t for k in [" GENERAL LIABILITY", " GL ", " PREMISES", " PRODUCTS LIABILITY", " CGL "]):
+        found.append("GENERAL LIABILITY")
+    if any(k in t for k in [" WORKERS' COMP", " WORKERS COMP", " WC ", " TTD", " TPD", " INDEMNITY"]):
+        found.append("WC")
+    if any(k in t for k in [" PROPERTY ", " DWELLING", " BUILDING", " CONTENTS", " FIRE", " THEFT"]):
+        found.append("PROPERTY")
+    return found or ["AUTO"]
+
+
+def extract_fields_openai(client, model: str, text: str, lob: str) -> Dict:
+    """Extract structured fields from text for a specific LoB"""
+    lob = lob.upper()
+    if lob == 'AUTO':
+        schema = {
+            "evaluation_date": "string",
+            "carrier": "string",
+            "claims": [{
+                "claim_number": "string",
+                "loss_date": "string",
+                "paid_loss": "string",
+                "reserve": "string",
+                "alae": "string"
+            }]
+        }
+    elif lob == 'PROPERTY':
+        schema = {
+            "evaluation_date": "string",
+            "carrier": "string",
+            "claims": [{
+                "claim_number": "string",
+                "loss_date": "string",
+                "paid_loss": "string",
+                "reserve": "string",
+                "alae": "string"
+            }]
+        }
+    elif lob in ('GENERAL LIABILITY', 'GL'):
+        schema = {
+            "evaluation_date": "string",
+            "carrier": "string",
+            "claims": [{
+                "claim_number": "string",
+                "loss_date": "string",
+                "bi_paid_loss": "string",
+                "pd_paid_loss": "string",
+                "bi_reserve": "string",
+                "pd_reserve": "string",
+                "alae": "string"
+            }]
+        }
+    else:  # WC
+        schema = {
+            "evaluation_date": "string",
+            "carrier": "string",
+            "claims": [{
+                "claim_number": "string",
+                "loss_date": "string",
+                "Indemnity_paid_loss": "string",
+                "Medical_paid_loss": "string",
+                "Indemnity_reserve": "string",
+                "Medical_reserve": "string",
+                "ALAE": "string"
+            }]
+        }
+        lob = 'WC'
+
+    prompt = f"""
+Extract structured fields from the content for LoB={lob}.
+Return STRICT JSON ONLY matching this schema with no commentary and no markdown fences:
+{schema}
+Rules: ISO dates if possible; keep amounts/strings as-is; empty string if missing; preserve row order.
+IMPORTANT: Extract the carrier/company name from the content. This is critical.
+
+Content:\n{text}
+"""
+    max_attempts = 3
+    delay_seconds = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=16000,
+                response_format={"type": "json_object"}
+            )
+            content = resp.choices[0].message.content
+            obj = json.loads(content)
+            if isinstance(obj, dict) and 'claims' in obj and isinstance(obj['claims'], list):
+                obj.setdefault('evaluation_date', '')
+                obj.setdefault('carrier', '')
+                return obj
+        except Exception:
+            if attempt == max_attempts:
+                break
+            time.sleep(delay_seconds)
+            delay_seconds *= 2
+            continue
+    return {"evaluation_date": "", "carrier": "", "claims": []}
+
+
+def extract_fields_openai_chunked(client, model: str, text: str, lob: str, progress_callback=None, max_chunk_size: int = 15000, api_delay: float = 0.3) -> Dict:
+    """Extract fields with chunking for long documents"""
+    chunks = _chunk_text(text, max_chars=max_chunk_size)
+    if not chunks:
+        chunks = [text]
+    
+    merged = {"evaluation_date": "", "carrier": "", "claims": []}
+    for idx, part in enumerate(chunks):
+        if progress_callback:
+            progress_callback(idx + 1, len(chunks))
+        
+        result = extract_fields_openai(client, model, part, lob)
+        if result.get('evaluation_date') and not merged['evaluation_date']:
+            merged['evaluation_date'] = result.get('evaluation_date', '')
+        if result.get('carrier') and not merged['carrier']:
+            merged['carrier'] = result.get('carrier', '')
+        if isinstance(result.get('claims'), list):
+            merged['claims'].extend(result['claims'])
+        time.sleep(api_delay)
+    return merged
+
+
 def process_pdf_with_openai(pdf_path: str, client, model: str, max_chunk_size: int = 15000, api_delay: float = 0.3) -> Dict:
     """
     Process PDF using OpenAI/Azure OpenAI
     Similar to text_lob_openai_extractor.py processing
     """
-    from text_lob_openai_extractor import (
-        classify_lobs_multi_openai,
-        extract_fields_openai_chunked
-    )
-    
     # Extract text
     text = extract_text_from_pdf(pdf_path)
     if not text:
@@ -214,7 +388,7 @@ def process_pdf_with_openai(pdf_path: str, client, model: str, max_chunk_size: i
     # Extract fields for each LOB
     results = []
     for lob in lobs:
-        fields = extract_fields_openai_chunked(client, model, text, lob, max_chunk_size, api_delay)
+        fields = extract_fields_openai_chunked(client, model, text, lob, None, max_chunk_size, api_delay)
         results.append({
             'lob': lob,
             'carrier': fields.get('carrier', ''),
@@ -356,11 +530,25 @@ def main():
     # ========================================================================
     st.header("📁 Available PDFs (Local File Structure)")
     
-    # Scan for PDFs
-    if st.button("🔄 Refresh PDF List"):
-        st.rerun()
+    # Automatically scan for PDFs on page load
+    # Store in session state to avoid re-scanning on every rerun
+    if 'pdf_files' not in st.session_state:
+        with st.spinner("🔍 Scanning for PDF files..."):
+            st.session_state['pdf_files'] = scan_local_pdfs("mock_documents")
     
-    pdf_files = scan_local_pdfs("mock_documents")
+    pdf_files = st.session_state['pdf_files']
+    
+    # Refresh button to re-scan
+    col_refresh, col_count = st.columns([1, 4])
+    with col_refresh:
+        if st.button("🔄 Refresh PDF List"):
+            with st.spinner("🔍 Scanning for PDF files..."):
+                st.session_state['pdf_files'] = scan_local_pdfs("mock_documents")
+                pdf_files = st.session_state['pdf_files']
+            st.rerun()
+    with col_count:
+        if pdf_files:
+            st.info(f"📊 Found {len(pdf_files)} PDF file(s) in local structure")
     
     if not pdf_files:
         st.warning("⚠️ No PDFs found in mock_documents directory. Please ensure the directory structure is correct.")
