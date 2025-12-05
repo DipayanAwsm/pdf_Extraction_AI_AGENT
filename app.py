@@ -1022,48 +1022,103 @@ def main():
         if extract_clicked and user_query:
             with st.spinner("Extracting information..."):
                 try:
-                    from langchain_google_genai import ChatGoogleGenerativeAI
-                    from langchain_core.prompts import ChatPromptTemplate
-                    from langchain_core.output_parsers import JsonOutputParser
-                    from pydantic import BaseModel, Field
-                    import os
+                    # Get config from session state
+                    app_cfg = st.session_state.get('app_config')
                     
-                    if not os.getenv("GOOGLE_API_KEY"):
-                        st.error("❌ GOOGLE_API_KEY not found")
+                    if not app_cfg:
+                        st.error("❌ No configuration found. Please configure in Tab 1 or create config.py")
                     else:
-                        class ExtractedInfo(BaseModel):
-                            account_name: str = Field(default="", description="Account name")
-                            lob: str = Field(default="", description="Line of Business")
-                            policy_number: str = Field(default="", description="Policy number")
-                            start_date: str = Field(default="", description="Start date DD-MM-YYYY")
-                            end_date: str = Field(default="", description="End date DD-MM-YYYY")
-                        
-                        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-                        parser = JsonOutputParser(pydantic_object=ExtractedInfo)
-                        
-                        accounts = ", ".join(email_agent.VALID_ACCOUNTS)
-                        lobs = ", ".join(email_agent.VALID_LOBS)
-                        
-                        prompt = ChatPromptTemplate.from_messages([
-                            ("system", f"""Extract search criteria from user query.
+                        # Setup OpenAI client
+                        client = setup_openai_client(app_cfg)
+                        if not client:
+                            st.error("❌ Failed to setup OpenAI client. Check your configuration in Tab 1.")
+                        else:
+                            # Get model name
+                            model = app_cfg.get('azure_deployment') if app_cfg.get('use_azure') else app_cfg.get('openai_model', 'gpt-4o-2024-08-06')
+                            
+                            accounts = ", ".join(email_agent.VALID_ACCOUNTS)
+                            lobs = ", ".join(email_agent.VALID_LOBS)
+                            
+                            # Define JSON schema for extraction
+                            schema = {
+                                "account_name": "string (Account name from valid list)",
+                                "lob": "string (Line of Business: AUTO, PROPERTY, GL, or WC)",
+                                "policy_number": "string (Policy number or claim number)",
+                                "start_date": "string (Start date in DD-MM-YYYY format)",
+                                "end_date": "string (End date in DD-MM-YYYY format)"
+                            }
+                            
+                            prompt = f"""Extract search criteria from the user query and return as JSON.
+
 Valid Accounts: {accounts}
 Valid LOBs: {lobs}
 
-Rules:
-- Map account variations: "chubbs/chubb" → "Chubbs", "amex" → "Amex", etc.
-- Map LOB variations: "auto/vehicle/car" → "AUTO", "work/wc/workers" → "WC", etc.
-- Date ranges: "2024-2025" → start: "01-01-2024", end: "31-12-2025"
-- "less than 2024" → end: "31-12-2024"
-- Return empty string for missing fields
+Extraction Rules:
+- Map account variations: "chubbs/chubb" → "Chubbs", "amex" → "Amex", "globalinsure" → "GlobalInsure", "techcorp" → "TechCorp", "travelers" → "Travelers"
+- Map LOB variations: "auto/vehicle/car" → "AUTO", "work/wc/workers comp" → "WC", "property" → "PROPERTY", "gl/general liability" → "GL"
+- Date ranges: "2024-2025" → start_date: "01-01-2024", end_date: "31-12-2025"
+- "less than 2024" or "before 2024" → end_date: "31-12-2024"
+- "after 2024" → start_date: "01-01-2024"
+- Return empty string "" for missing fields
+- Always return valid JSON matching this schema: {schema}
 
-{{format_instructions}}"""),
-                            ("user", "{query}")
-                        ])
-                        
-                        chain = prompt | llm | parser
-                        extracted = chain.invoke({"query": user_query, "format_instructions": parser.get_format_instructions()})
-                        st.session_state['extracted_info'] = extracted
-                        st.success("✅ Extracted!")
+User Query: {user_query}
+
+Return ONLY valid JSON with no markdown, no code blocks, no explanation:"""
+                            
+                            try:
+                                resp = client.chat.completions.create(
+                                    model=model,
+                                    messages=[{"role": "user", "content": prompt}],
+                                    temperature=0.0,
+                                    max_tokens=500,
+                                    response_format={"type": "json_object"}
+                                )
+                                
+                                content = resp.choices[0].message.content
+                                extracted = json.loads(content)
+                                
+                                # Validate and normalize extracted data
+                                if not isinstance(extracted, dict):
+                                    extracted = {}
+                                
+                                # Normalize account name
+                                account = extracted.get('account_name', '').strip()
+                                if account:
+                                    account_lower = account.lower()
+                                    for valid_account in email_agent.VALID_ACCOUNTS:
+                                        if valid_account.lower() in account_lower or account_lower in valid_account.lower():
+                                            extracted['account_name'] = valid_account
+                                            break
+                                
+                                # Normalize LOB
+                                lob = extracted.get('lob', '').strip().upper()
+                                if lob:
+                                    if 'AUTO' in lob or 'VEHICLE' in lob or 'CAR' in lob:
+                                        extracted['lob'] = 'AUTO'
+                                    elif 'WC' in lob or 'WORK' in lob or 'WORKERS' in lob:
+                                        extracted['lob'] = 'WC'
+                                    elif 'PROPERTY' in lob:
+                                        extracted['lob'] = 'PROPERTY'
+                                    elif 'GL' in lob or 'GENERAL' in lob or 'LIABILITY' in lob:
+                                        extracted['lob'] = 'GL'
+                                    else:
+                                        extracted['lob'] = lob
+                                
+                                # Ensure all required fields exist
+                                extracted.setdefault('account_name', '')
+                                extracted.setdefault('lob', '')
+                                extracted.setdefault('policy_number', '')
+                                extracted.setdefault('start_date', '')
+                                extracted.setdefault('end_date', '')
+                                
+                                st.session_state['extracted_info'] = extracted
+                                st.success("✅ Extracted!")
+                                
+                            except json.JSONDecodeError as e:
+                                st.error(f"❌ Failed to parse JSON response: {e}")
+                            except Exception as e:
+                                st.error(f"❌ Extraction error: {e}")
                         
                 except Exception as e:
                     st.error(f"Extraction error: {e}")

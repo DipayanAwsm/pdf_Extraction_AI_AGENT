@@ -43,7 +43,7 @@ OPENAI_MODEL = "gpt-4o-2024-08-06"
 
 # For Azure OpenAI (if you use Azure endpoint)
 # If using Azure OpenAI, set USE_AZURE_OPENAI=True and fill the below
-USE_AZURE_OPENAI = False
-AZURE_OPENAI_ENDPOINT = "https://your-azure-openai-resource.openai.azure.com/"
-AZURE_OPENAI_API_KEY = "YOUR_AZURE_OPENAI_API_KEY"
-AZURE_OPENAI_DEPLOYMENT_NAME = "your-deployment-name"
+USE_AZURE_OPENAI = True  # Change this to True to enable Azure OpenAI
+AZURE_OPENAI_ENDPOINT = "https://your-azure-openai-resource.openai.azure.com/"  # Replace with your Azure OpenAI endpoint
+AZURE_OPENAI_API_KEY = "YOUR_AZURE_OPENAI_API_KEY"  # Replace with your Azure OpenAI API key
+AZURE_OPENAI_DEPLOYMENT_NAME = "your-deployment-name"  # Replace with your Llama deployment name (e.g., "llama-3-70b" or "gpt-4")
