@@ -24,6 +24,19 @@ import io
 import pandas as pd
 import streamlit as st
 
+# Load configuration from streamlit_config if available
+try:
+    from streamlit_config import (
+        PYTHON_CMD, CONFIG_FILE, OCR_TIMEOUT, LOB_TIMEOUT, SHOW_DEBUG_INFO, SHOW_COMMAND_OUTPUT
+    )
+except ImportError:
+    PYTHON_CMD = "python"
+    CONFIG_FILE = "config.py"
+    OCR_TIMEOUT = 1200
+    LOB_TIMEOUT = 1800
+    SHOW_DEBUG_INFO = True
+    SHOW_COMMAND_OUTPUT = True
+
 try:
     from openai import OpenAI
 except ImportError:
@@ -307,248 +320,239 @@ def filter_pdfs_by_criteria(pdf_files: List[Dict], criteria: Dict) -> List[Dict]
 
 
 # ============================================================================
-# PDF Processing Functions (from streamlit_e2e_openai_app.py)
+# PDF Processing Functions (EXACT COPY from streamlit_e2e_openai_app.py)
 # ============================================================================
 
-def extract_text_from_pdf(pdf_path: str) -> str:
-    """Extract text from PDF using pdfplumber"""
-    text_content = []
+def create_directories():
+    """Create necessary directories"""
+    backup_dir = Path("./backup")
+    tmp_dir = Path("./tmp")
+    results_dir = Path("./results")
+    
+    backup_dir.mkdir(exist_ok=True)
+    tmp_dir.mkdir(exist_ok=True)
+    results_dir.mkdir(exist_ok=True)
+    
+    return backup_dir, tmp_dir, results_dir
+
+
+def convert_pdf_to_text(pdf_path, tmp_dir, debug_log_container=None):
+    """Convert PDF to text using fitzTest3.py"""
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text_content.append(page_text)
-                
-                # Also extract tables
-                tables = page.extract_tables()
-                for table in tables:
-                    if table:
-                        for row in table:
-                            if row:
-                                row_text = " | ".join([str(cell) if cell else "" for cell in row])
-                                text_content.append(row_text)
-    except Exception as e:
-        st.error(f"Error extracting text from PDF: {e}")
-        return ""
-    
-    return "\n".join(text_content)
-
-
-def _chunk_text(text: str, max_chars: int = 15000, overlap_chars: int = 800) -> List[str]:
-    """Split text into chunks for processing"""
-    chunks: List[str] = []
-    if not text:
-        return chunks
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(start + max_chars, n)
-        if end < n:
-            nl = text.rfind("\n", start, end)
-            if nl != -1 and nl > start + 1000:
-                end = nl
-        chunks.append(text[start:end])
-        if end >= n:
-            break
-        start = max(0, end - overlap_chars)
-    return chunks
-
-
-def classify_lobs_multi_openai(client, model: str, text: str) -> List[str]:
-    """Classify Lines of Business from text content"""
-    prompt = f"""
-You are an insurance domain expert. Determine ALL Lines of Business (LoBs) present in the content.
-Choose any that apply from exactly these values: AUTO, GENERAL LIABILITY, WC, PROPERTY.
-Return STRICT JSON ONLY with no commentary and no markdown. Use double quotes and valid JSON.
-Schema: {{"lobs": ["AUTO"|"GENERAL LIABILITY"|"WC"|"PROPERTY", ...]}}
-Content:\n{text[:10000]}
-"""
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=500,
-            response_format={"type": "json_object"}
-        )
-        content = resp.choices[0].message.content
-        obj = json.loads(content)
-        lobs = obj.get('lobs') or []
-        out = []
-        for v in lobs:
-            s = str(v).strip().upper()
-            if s in {"AUTO", "GENERAL LIABILITY", "WC", "PROPERTY"} and s not in out:
-                out.append(s)
-        if out:
-            return out
-    except Exception:
-        pass
-    
-    # Fallback heuristic
-    t = text.upper()
-    found = []
-    if any(k in t for k in [" AUTO ", " AUTOMOBILE", " VEHICLE", " VIN ", " COLLISION", " COMPREHENSIVE", " LICENSE PLATE"]):
-        found.append("AUTO")
-    if any(k in t for k in [" GENERAL LIABILITY", " GL ", " PREMISES", " PRODUCTS LIABILITY", " CGL "]):
-        found.append("GENERAL LIABILITY")
-    if any(k in t for k in [" WORKERS' COMP", " WORKERS COMP", " WC ", " TTD", " TPD", " INDEMNITY"]):
-        found.append("WC")
-    if any(k in t for k in [" PROPERTY ", " DWELLING", " BUILDING", " CONTENTS", " FIRE", " THEFT"]):
-        found.append("PROPERTY")
-    return found or ["AUTO"]
-
-
-def extract_fields_openai(client, model: str, text: str, lob: str) -> Dict:
-    """Extract structured fields from text for a specific LoB"""
-    lob = lob.upper()
-    if lob == 'AUTO':
-        schema = {
-            "evaluation_date": "string",
-            "carrier": "string",
-            "claims": [{
-                "claim_number": "string",
-                "loss_date": "string",
-                "paid_loss": "string",
-                "reserve": "string",
-                "alae": "string"
-            }]
-        }
-    elif lob == 'PROPERTY':
-        schema = {
-            "evaluation_date": "string",
-            "carrier": "string",
-            "claims": [{
-                "claim_number": "string",
-                "loss_date": "string",
-                "paid_loss": "string",
-                "reserve": "string",
-                "alae": "string"
-            }]
-        }
-    elif lob in ('GENERAL LIABILITY', 'GL'):
-        schema = {
-            "evaluation_date": "string",
-            "carrier": "string",
-            "claims": [{
-                "claim_number": "string",
-                "loss_date": "string",
-                "bi_paid_loss": "string",
-                "pd_paid_loss": "string",
-                "bi_reserve": "string",
-                "pd_reserve": "string",
-                "alae": "string"
-            }]
-        }
-    else:  # WC
-        schema = {
-            "evaluation_date": "string",
-            "carrier": "string",
-            "claims": [{
-                "claim_number": "string",
-                "loss_date": "string",
-                "Indemnity_paid_loss": "string",
-                "Medical_paid_loss": "string",
-                "Indemnity_reserve": "string",
-                "Medical_reserve": "string",
-                "ALAE": "string"
-            }]
-        }
-        lob = 'WC'
-
-    prompt = f"""
-Extract structured fields from the content for LoB={lob}.
-Return STRICT JSON ONLY matching this schema with no commentary and no markdown fences:
-{schema}
-Rules: ISO dates if possible; keep amounts/strings as-is; empty string if missing; preserve row order.
-IMPORTANT: Extract the carrier/company name from the content. This is critical.
-
-Content:\n{text}
-"""
-    max_attempts = 3
-    delay_seconds = 1.0
-    for attempt in range(1, max_attempts + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=16000,
-                response_format={"type": "json_object"}
-            )
-            content = resp.choices[0].message.content
-            obj = json.loads(content)
-            if isinstance(obj, dict) and 'claims' in obj and isinstance(obj['claims'], list):
-                obj.setdefault('evaluation_date', '')
-                obj.setdefault('carrier', '')
-                return obj
-        except Exception:
-            if attempt == max_attempts:
-                break
-            time.sleep(delay_seconds)
-            delay_seconds *= 2
-            continue
-    return {"evaluation_date": "", "carrier": "", "claims": []}
-
-
-def extract_fields_openai_chunked(client, model: str, text: str, lob: str, progress_callback=None, max_chunk_size: int = 15000, api_delay: float = 0.3) -> Dict:
-    """Extract fields with chunking for long documents"""
-    chunks = _chunk_text(text, max_chars=max_chunk_size)
-    if not chunks:
-        chunks = [text]
-    
-    merged = {"evaluation_date": "", "carrier": "", "claims": []}
-    for idx, part in enumerate(chunks):
-        if progress_callback:
-            progress_callback(idx + 1, len(chunks))
+        cmd = [PYTHON_CMD, "fitzTest3.py", str(pdf_path), "--output", str(tmp_dir)]
         
-        result = extract_fields_openai(client, model, part, lob)
-        if result.get('evaluation_date') and not merged['evaluation_date']:
-            merged['evaluation_date'] = result.get('evaluation_date', '')
-        if result.get('carrier') and not merged['carrier']:
-            merged['carrier'] = result.get('carrier', '')
-        if isinstance(result.get('claims'), list):
-            merged['claims'].extend(result['claims'])
-        time.sleep(api_delay)
-    return merged
+        if st.session_state.get('debug_mode') and debug_log_container:
+            # Real-time output capture
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+            
+            output_lines = []
+            log_buffer = []
+            for line in process.stdout:
+                line = line.rstrip()
+                if line:
+                    output_lines.append(line)
+                    log_line = f"[PDF->Text] {line}"
+                    log_buffer.append(log_line)
+                    if 'debug_logs' in st.session_state:
+                        st.session_state.debug_logs.append(log_line)
+            
+            # Update debug log container with all lines
+            if debug_log_container and log_buffer:
+                debug_log_container.code('\n'.join(log_buffer), language='text')
+            
+            process.wait()
+            result_code = process.returncode
+            stdout_text = '\n'.join(output_lines)
+        else:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=OCR_TIMEOUT
+            )
+            result_code = result.returncode
+            stdout_text = result.stdout
+        
+        if result_code == 0:
+            output_lines = stdout_text.strip().split('\n')
+            for line in output_lines:
+                if line.startswith("SUCCESS:"):
+                    return line.replace("SUCCESS:", "").strip(), None
+            time.sleep(0.5)
+            txts = list(Path(tmp_dir).glob("*_extracted.txt"))
+            if txts:
+                return str(txts[0]), None
+            return None, "Text file not found after conversion"
+        
+        return None, stdout_text or "Conversion failed"
+        
+    except subprocess.TimeoutExpired:
+        return None, "PDF conversion timed out"
+    except Exception as e:
+        return None, str(e)
 
 
-def process_pdf_with_openai(pdf_path: str, client, model: str, max_chunk_size: int = 15000, api_delay: float = 0.3) -> Dict:
-    """
-    Process PDF using OpenAI/Azure OpenAI
-    Similar to text_lob_openai_extractor.py processing
-    """
-    # Extract text
-    text = extract_text_from_pdf(pdf_path)
-    if not text:
-        return {"error": "No text extracted from PDF"}
-    
-    # Classify LOBs
-    lobs = classify_lobs_multi_openai(client, model, text)
-    
-    # Extract fields for each LOB
-    results = []
-    for lob in lobs:
-        fields = extract_fields_openai_chunked(client, model, text, lob, None, max_chunk_size, api_delay)
-        results.append({
-            'lob': lob,
-            'carrier': fields.get('carrier', ''),
-            'evaluation_date': fields.get('evaluation_date', ''),
-            'claims': fields.get('claims', [])
-        })
-        time.sleep(api_delay)
-    
-    return {
-        'success': True,
-        'detected_lobs': lobs,
-        'results': results,
-        'source_file': Path(pdf_path).name
-    }
+def process_text_with_openai(text_file_path, results_dir, original_pdf_name, debug_log_container=None):
+    """Process text file using text_lob_openai_extractor.py"""
+    try:
+        # Create timestamped output directory with original filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        original_name_no_ext = Path(original_pdf_name).stem
+        output_dir_name = f"{original_name_no_ext}_{timestamp}"
+        output_dir = results_dir / output_dir_name
+        output_dir.mkdir(exist_ok=True)
+        
+        cmd = [
+            PYTHON_CMD, "text_lob_openai_extractor.py",
+            str(text_file_path),
+            "--config", CONFIG_FILE,
+            "--out", str(output_dir)
+        ]
+        
+        if st.session_state.get('debug_mode') and debug_log_container:
+            # Real-time output capture
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+            
+            output_lines = []
+            log_buffer = []
+            for line in process.stdout:
+                line = line.rstrip()
+                if line:
+                    output_lines.append(line)
+                    log_line = f"[OpenAI] {line}"
+                    log_buffer.append(log_line)
+                    if 'debug_logs' in st.session_state:
+                        st.session_state.debug_logs.append(log_line)
+            
+            # Update debug log container with all lines
+            if debug_log_container and log_buffer:
+                debug_log_container.code('\n'.join(log_buffer), language='text')
+            
+            process.wait()
+            result_code = process.returncode
+            stderr_text = '\n'.join(output_lines)
+        else:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=LOB_TIMEOUT
+            )
+            result_code = result.returncode
+            stderr_text = result.stderr
+        
+        if result_code == 0:
+            excel_files = list(output_dir.glob("result.xlsx"))
+            if excel_files:
+                # Rename result.xlsx to include original filename and timestamp
+                original_result = excel_files[0]
+                new_filename = f"{original_name_no_ext}_{timestamp}_result.xlsx"
+                final_result_path = output_dir / new_filename
+                
+                # Copy the file with new name
+                shutil.copy2(original_result, final_result_path)
+                
+                return str(final_result_path), None
+            return None, "Extraction completed but result.xlsx not found"
+        
+        return None, stderr_text or "Extraction failed"
+        
+    except subprocess.TimeoutExpired:
+        return None, "OpenAI extraction timed out"
+    except Exception as e:
+        return None, str(e)
 
 
 # ============================================================================
-# Email Agent Functions
+# Email Agent Functions with CSV-based LOB Mapping
 # ============================================================================
+
+def load_lob_email_mapping(csv_path: str = "lob_email_mapping.csv") -> Dict[str, List[Dict]]:
+    """
+    Load LOB to email mapping from CSV file
+    Returns: {LOB: [{'email': '...', 'description': '...'}, ...]}
+    """
+    mapping = {}
+    
+    csv_file = Path(csv_path)
+    if not csv_file.exists():
+        st.warning(f"⚠️ Email mapping CSV not found at {csv_path}. Creating default file.")
+        # Create default CSV
+        default_data = {
+            'LOB': ['AUTO', 'AUTO', 'PROPERTY', 'PROPERTY', 'GL', 'GL', 'WC', 'WC'],
+            'Email': [
+                'auto-claims@example.com',
+                'auto-processing@example.com',
+                'property-claims@example.com',
+                'property-processing@example.com',
+                'gl-claims@example.com',
+                'gl-processing@example.com',
+                'wc-claims@example.com',
+                'wc-processing@example.com'
+            ],
+            'Description': [
+                'Auto Claims Department',
+                'Auto Processing Team',
+                'Property Claims Department',
+                'Property Processing Team',
+                'General Liability Claims Department',
+                'General Liability Processing Team',
+                'Workers Compensation Claims Department',
+                'Workers Compensation Processing Team'
+            ]
+        }
+        pd.DataFrame(default_data).to_csv(csv_file, index=False)
+        st.info(f"✅ Created default email mapping file: {csv_path}")
+    
+    try:
+        df = pd.read_csv(csv_file)
+        
+        for _, row in df.iterrows():
+            lob = str(row.get('LOB', '')).strip().upper()
+            email = str(row.get('Email', '')).strip()
+            description = str(row.get('Description', '')).strip()
+            
+            if lob and email:
+                if lob not in mapping:
+                    mapping[lob] = []
+                mapping[lob].append({
+                    'email': email,
+                    'description': description
+                })
+    except Exception as e:
+        st.error(f"Error loading email mapping CSV: {e}")
+    
+    return mapping
+
+
+def format_time(seconds):
+    """Format seconds into readable time string"""
+    if seconds < 60:
+        return f"{seconds:.2f} seconds"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        return f"{minutes} minutes {secs:.1f} seconds"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        return f"{hours} hours {minutes} minutes {secs:.1f} seconds"
+
 
 def send_extracted_data_email(pdf_info: Dict, extracted_data: Dict, recipient_email: Optional[str] = None):
     """
@@ -567,25 +571,10 @@ def send_extracted_data_email(pdf_info: Dict, extracted_data: Dict, recipient_em
         LOB_EMAILS[lob] = recipient_email
     
     try:
-        # Create a summary of extracted data
-        summary_text = f"""
-Extracted Claims Data Summary:
-- Account: {pdf_info.get('account', 'N/A')}
-- LOB: {lob}
-- Policy Number: {policy_number}
-- Evaluation Date: {extracted_data.get('results', [{}])[0].get('evaluation_date', 'N/A') if extracted_data.get('results') else 'N/A'}
-
-Detected LOBs: {', '.join(extracted_data.get('detected_lobs', []))}
-
-Total Claims Extracted: {sum(len(r.get('claims', [])) for r in extracted_data.get('results', []))}
-"""
-        
         # Send email with PDF attachment
         success, message = send_email_action(pdf_info, lob, policy_number)
         
         if success:
-            # Optionally send extracted data as JSON attachment
-            # (This would require modifying send_email_action to accept additional data)
             return True, f"Email sent successfully: {message}"
         else:
             return False, f"Email failed: {message}"
@@ -826,153 +815,261 @@ def main():
                 except Exception as e:
                     st.warning(f"Could not preview PDF: {e}")
             
-            # Processing Section
+            # Processing Section (EXACT COPY from streamlit_e2e_openai_app.py)
             st.subheader("🚀 Process PDF")
             
-            if st.button("▶️ Start Processing", type="primary"):
+            # Initialize session state for processing
+            if 'processing_complete' not in st.session_state:
+                st.session_state.processing_complete = False
+            if 'result_file' not in st.session_state:
+                st.session_state.result_file = None
+            if 'processing_status' not in st.session_state:
+                st.session_state.processing_status = "Ready"
+            if 'processing_times' not in st.session_state:
+                st.session_state.processing_times = {}
+            if 'debug_mode' not in st.session_state:
+                st.session_state.debug_mode = False
+            if 'debug_logs' not in st.session_state:
+                st.session_state.debug_logs = []
+            
+            # Debug mode toggle
+            debug_mode = st.checkbox("🐛 Debug Mode (Show Real-time Logs)", value=st.session_state.debug_mode)
+            st.session_state.debug_mode = debug_mode
+            
+            if st.button("▶️ Start Processing", type="primary", disabled=st.session_state.processing_status == "Processing"):
+                st.session_state.processing_status = "Processing"
+                st.session_state.processing_times = {}
+                
+                # Create directories
+                backup_dir, tmp_dir, results_dir = create_directories()
+                
+                # Copy PDF to backup
+                backup_path = backup_dir / selected_pdf['filename']
+                shutil.copy2(selected_pdf['path'], backup_path)
+                
                 progress_bar = st.progress(0)
                 status_text = st.empty()
+                log_container = st.empty()
+                debug_log_container = st.empty() if st.session_state.debug_mode else None
+                
+                # Clear debug logs at start
+                if st.session_state.debug_mode:
+                    st.session_state.debug_logs = []
                 
                 try:
-                    status_text.text("📖 Extracting text from PDF...")
+                    start_total = time.time()
+                    
+                    # Step 1: Convert PDF to text
+                    status_text.text("Step 1/3: Converting PDF to text...")
                     progress_bar.progress(0.2)
                     
-                    # Extract and process
-                    status_text.text("🤖 Processing with AI...")
-                    progress_bar.progress(0.5)
-                    
-                    extracted_data = process_pdf_with_openai(
-                        selected_pdf['path'],
-                        client,
-                        model,
-                        cfg.get('max_chunk_size', 15000),
-                        cfg.get('api_delay', 0.3)
-                    )
-                    
-                    progress_bar.progress(0.9)
-                    
-                    if extracted_data.get('success'):
-                        st.session_state['extracted_data'] = extracted_data
-                        st.session_state['processed_pdf'] = selected_pdf
-                        
-                        status_text.text("✅ Processing complete!")
-                        progress_bar.progress(1.0)
-                        st.success("🎉 PDF processed successfully!")
+                    if st.session_state.debug_mode:
+                        st.markdown("**📋 Real-time Debug Logs (PDF to Text):**")
+                        debug_placeholder = st.empty()
                     else:
-                        st.error(f"❌ Processing failed: {extracted_data.get('error', 'Unknown error')}")
+                        debug_placeholder = None
+                    
+                    start_ocr = time.time()
+                    text_file_path, error = convert_pdf_to_text(backup_path, tmp_dir, debug_placeholder)
+                    ocr_time = time.time() - start_ocr
+                    st.session_state.processing_times['PDF to Text'] = ocr_time
+                    
+                    if not text_file_path:
+                        st.session_state.processing_status = "Error"
+                        st.error(f"Error: {error}")
+                        return
+                    
+                    with log_container.expander("PDF Conversion Log", expanded=False):
+                        st.text(f"[SUCCESS] Text file created: {text_file_path}")
+                        st.text(f"Time taken: {format_time(ocr_time)}")
+                    
+                    # Step 2: Process with OpenAI
+                    status_text.text("Step 2/3: Processing text with OpenAI...")
+                    progress_bar.progress(0.6)
+                    
+                    if st.session_state.debug_mode:
+                        st.markdown("**📋 Real-time Debug Logs (OpenAI Extraction):**")
+                        debug_placeholder_openai = st.empty()
+                    else:
+                        debug_placeholder_openai = None
+                    
+                    start_openai = time.time()
+                    result_file_path, error = process_text_with_openai(
+                        text_file_path,
+                        results_dir,
+                        selected_pdf['filename'],
+                        debug_placeholder_openai
+                    )
+                    openai_time = time.time() - start_openai
+                    st.session_state.processing_times['OpenAI Extraction'] = openai_time
+                    
+                    if not result_file_path:
+                        st.session_state.processing_status = "Error"
+                        st.error(f"Error: {error}")
+                        return
+                    
+                    # Step 3: Complete
+                    total_time = time.time() - start_total
+                    st.session_state.processing_times['Total Time'] = total_time
+                    
+                    status_text.text("Step 3/3: Finalizing results...")
+                    progress_bar.progress(1.0)
+                    
+                    st.session_state.processing_complete = True
+                    st.session_state.result_file = result_file_path
+                    st.session_state.processing_status = "Complete"
+                    st.session_state['processed_pdf'] = selected_pdf
+                    
+                    st.success("🎉 Processing completed successfully!")
+                    
+                    # Load Excel to extract detected LOBs
+                    try:
+                        excel_data = pd.read_excel(result_file_path, sheet_name=None)
+                        detected_lobs = []
+                        for sheet_name in excel_data.keys():
+                            sn = str(sheet_name).lower()
+                            if 'auto' in sn:
+                                detected_lobs.append('AUTO')
+                            elif 'property' in sn:
+                                detected_lobs.append('PROPERTY')
+                            elif 'gl' in sn:
+                                detected_lobs.append('GL')
+                            elif 'wc' in sn:
+                                detected_lobs.append('WC')
+                        
+                        st.session_state['detected_lobs'] = list(set(detected_lobs))
+                    except:
+                        st.session_state['detected_lobs'] = [selected_pdf.get('lob', 'AUTO')]
                 
                 except Exception as e:
-                    st.error(f"❌ Error during processing: {str(e)}")
+                    st.session_state.processing_status = "Error"
+                    st.error(f"Exception: {str(e)}")
                 finally:
                     progress_bar.empty()
             
             # ================================================================
-            # Section 3: Display Extracted Results
+            # Section 3: Display Results (from streamlit_e2e_openai_app.py)
             # ================================================================
-            extracted_data = st.session_state.get('extracted_data')
-            processed_pdf = st.session_state.get('processed_pdf')
-            
-            if extracted_data and processed_pdf and processed_pdf['path'] == selected_pdf['path']:
-                st.markdown("---")
-                st.header("📊 Extracted Data Results")
+            if st.session_state.processing_complete and st.session_state.result_file:
+                result_file = Path(st.session_state.result_file)
+                processed_pdf = st.session_state.get('processed_pdf')
                 
-                # Summary
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Detected LOBs", len(extracted_data.get('detected_lobs', [])))
-                with col2:
-                    total_claims = sum(len(r.get('claims', [])) for r in extracted_data.get('results', []))
-                    st.metric("Total Claims", total_claims)
-                with col3:
-                    carrier = extracted_data.get('results', [{}])[0].get('carrier', 'N/A') if extracted_data.get('results') else 'N/A'
-                    st.metric("Carrier", carrier[:20] if carrier else 'N/A')
-                
-                # Display results by LOB
-                for lob_result in extracted_data.get('results', []):
-                    lob = lob_result.get('lob', 'Unknown')
-                    claims = lob_result.get('claims', [])
+                if result_file.exists() and processed_pdf and processed_pdf['path'] == selected_pdf['path']:
+                    st.markdown("---")
+                    st.header("📊 Processing Results")
                     
-                    with st.expander(f"📋 {lob} Claims ({len(claims)} found)", expanded=True):
-                        st.write(f"**Carrier:** {lob_result.get('carrier', 'N/A')}")
-                        st.write(f"**Evaluation Date:** {lob_result.get('evaluation_date', 'N/A')}")
+                    # Display processing times
+                    if st.session_state.processing_times:
+                        st.markdown("**⏱️ Processing Times**")
+                        times_df = pd.DataFrame([
+                            {"Step": k, "Time": format_time(v)}
+                            for k, v in st.session_state.processing_times.items()
+                        ])
+                        st.dataframe(times_df, use_container_width=True, hide_index=True)
+                    
+                    # Preview Excel content
+                    try:
+                        excel_data = pd.read_excel(result_file, sheet_name=None)
                         
-                        if claims:
-                            df = pd.DataFrame(claims)
+                        # Display sheets
+                        if len(excel_data) == 1:
+                            sheet_name = list(excel_data.keys())[0]
+                            df = excel_data[sheet_name]
+                            st.write(f"**Sheet:** {sheet_name}")
                             st.dataframe(df, use_container_width=True)
-                            
-                            # Download button for this LOB
-                            output = pd.ExcelWriter(io.BytesIO(), engine='openpyxl')
-                            df.to_excel(output, sheet_name=f"{lob}_claims", index=False)
-                            output.close()
-                            
-                            excel_bytes = output.buffer.getvalue()
-                            st.download_button(
-                                label=f"📥 Download {lob} Claims (Excel)",
-                                data=excel_bytes,
-                                file_name=f"{selected_pdf['filename']}_{lob}_claims.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                key=f"download_{lob}"
-                            )
                         else:
-                            st.info("No claims found for this LOB")
-                
-                # ============================================================
-                # Section 4: Email Agent
-                # ============================================================
-                st.markdown("---")
-                st.header("📧 Send Extracted Data via Email")
-                
-                col_email1, col_email2 = st.columns([2, 1])
-                
-                with col_email1:
-                    recipient_email = st.text_input(
-                        "Recipient Email (optional - uses default LOB email if empty)",
-                        value="",
-                        help="Leave empty to use default email for this LOB"
-                    )
-                
-                with col_email2:
-                    st.write("")  # Spacing
-                    send_email_btn = st.button("📤 Send Email", type="primary")
-                
-                if send_email_btn:
-                    if send_email_action:
-                        with st.spinner("Sending email..."):
-                            success, message = send_extracted_data_email(
-                                selected_pdf,
-                                extracted_data,
-                                recipient_email if recipient_email else None
-                            )
-                            
-                            if success:
-                                st.success(f"✅ {message}")
-                            else:
-                                st.error(f"❌ {message}")
-                    else:
-                        st.error("Email agent not available. Please ensure email_agent.py is properly configured.")
-                
-                # Download all results
-                st.markdown("---")
-                st.subheader("📥 Download All Results")
-                
-                if st.button("💾 Download Complete Results (Excel)"):
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        for lob_result in extracted_data.get('results', []):
-                            lob = lob_result.get('lob', 'Unknown')
-                            claims = lob_result.get('claims', [])
-                            if claims:
-                                df = pd.DataFrame(claims)
-                                sheet_name = f"{lob}_claims"[:31]  # Excel sheet name limit
-                                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                            for sheet_name, df in excel_data.items():
+                                with st.expander(f"📄 {sheet_name}", expanded=(sheet_name == list(excel_data.keys())[0])):
+                                    st.dataframe(df, use_container_width=True)
+                    except Exception as e:
+                        st.warning(f"Could not preview Excel content: {e}")
                     
-                    output.seek(0)
-                    st.download_button(
-                        label="⬇️ Download All Claims (Excel)",
-                        data=output.getvalue(),
-                        file_name=f"{selected_pdf['filename']}_all_claims.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                    # Download button
+                    with open(result_file, "rb") as f:
+                        st.download_button(
+                            label="📥 Download Excel File",
+                            data=f.read(),
+                            file_name=result_file.name,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            type="primary"
+                        )
+                    
+                    # ============================================================
+                    # Section 4: Email Agent with CSV-based LOB Dropdown
+                    # ============================================================
+                    st.markdown("---")
+                    st.header("📧 Send Extracted Data via Email")
+                    
+                    # Load email mapping from CSV
+                    email_mapping = load_lob_email_mapping("lob_email_mapping.csv")
+                    detected_lobs = st.session_state.get('detected_lobs', [selected_pdf.get('lob', 'AUTO')])
+                    
+                    if detected_lobs:
+                        st.info(f"📋 Detected LOBs: {', '.join(detected_lobs)}")
+                        
+                        # Create dropdown for each detected LOB
+                        selected_emails = {}
+                        for lob in detected_lobs:
+                            lob_emails = email_mapping.get(lob, [])
+                            if lob_emails:
+                                email_options = [f"{email['email']} - {email['description']}" for email in lob_emails]
+                                selected_email_display = st.selectbox(
+                                    f"Select Email for {lob}",
+                                    options=email_options,
+                                    key=f"email_select_{lob}",
+                                    help=f"Choose recipient email for {lob} claims"
+                                )
+                                # Extract email from display string
+                                selected_email = selected_email_display.split(' - ')[0] if ' - ' in selected_email_display else selected_email_display
+                                selected_emails[lob] = selected_email
+                            else:
+                                st.warning(f"⚠️ No email mapping found for {lob} in CSV. Please add entries to lob_email_mapping.csv")
+                                # Allow manual entry
+                                manual_email = st.text_input(
+                                    f"Enter Email for {lob}",
+                                    key=f"manual_email_{lob}",
+                                    help="Enter email address manually"
+                                )
+                                if manual_email:
+                                    selected_emails[lob] = manual_email
+                        
+                        # Send email button
+                        col_email1, col_email2 = st.columns([2, 1])
+                        with col_email1:
+                            st.write("")  # Spacing
+                        with col_email2:
+                            send_email_btn = st.button("📤 Send Email", type="primary")
+                        
+                        if send_email_btn:
+                            if send_email_action:
+                                with st.spinner("Sending email..."):
+                                    # Send email for each LOB
+                                    success_count = 0
+                                    error_messages = []
+                                    
+                                    for lob, email in selected_emails.items():
+                                        if email:
+                                            success, message = send_extracted_data_email(
+                                                selected_pdf,
+                                                {'detected_lobs': [lob]},  # Simplified data structure
+                                                email
+                                            )
+                                            
+                                            if success:
+                                                success_count += 1
+                                                st.success(f"✅ Email sent to {email} for {lob}")
+                                            else:
+                                                error_messages.append(f"{lob}: {message}")
+                                                st.error(f"❌ Failed to send email for {lob}: {message}")
+                                    
+                                    if success_count > 0:
+                                        st.success(f"✅ Successfully sent {success_count} email(s)")
+                                    if error_messages:
+                                        st.error("❌ Some emails failed to send")
+                            else:
+                                st.error("Email agent not available. Please ensure email_agent.py is properly configured.")
+                    else:
+                        st.warning("⚠️ No LOBs detected. Cannot suggest email addresses.")
         else:
             st.info("👆 Select a PDF from the list above to begin processing")
     

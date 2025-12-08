@@ -1,0 +1,10 @@
+LOB,Email,Description
+AUTO,auto-claims@example.com,Auto Claims Department
+AUTO,auto-processing@example.com,Auto Processing Team
+PROPERTY,property-claims@example.com,Property Claims Department
+PROPERTY,property-processing@example.com,Property Processing Team
+GL,gl-claims@example.com,General Liability Claims Department
+GL,gl-processing@example.com,General Liability Processing Team
+WC,wc-claims@example.com,Workers Compensation Claims Department
+WC,wc-processing@example.com,Workers Compensation Processing Team
+
