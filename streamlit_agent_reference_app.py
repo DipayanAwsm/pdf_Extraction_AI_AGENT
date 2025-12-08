@@ -4,9 +4,9 @@ Streamlit Agent Reference App
 =============================
 A reference implementation that:
 1. Shows all PDFs from local file structure (mock_documents)
-2. Uses config.py for Azure OpenAI configuration
-3. Has AI agent that collects data from local files
-4. Has mailing agent that sends extracted data
+2. Uses config.py for processing configuration
+3. Has search agent that finds documents based on LOB/keywords
+4. Has mailing agent that sends extracted data based on LOB
 5. Allows selecting a single PDF and processing it like streamlit_e2e_openai_app.py
 """
 
@@ -37,11 +37,7 @@ except ImportError:
     SHOW_DEBUG_INFO = True
     SHOW_COMMAND_OUTPUT = True
 
-try:
-    from openai import OpenAI
-except ImportError:
-    st.error("Please install openai: pip install openai>=1.30.0")
-    st.stop()
+# OpenAI removed - using external scripts for processing
 
 try:
     import pdfplumber
@@ -72,7 +68,7 @@ def load_config(config_file: str = "config.py") -> Dict[str, str]:
     """Load configuration from config.py file"""
     config_path = Path(config_file)
     if not config_path.exists():
-        return None
+        return {}
     try:
         import importlib.util
         spec = importlib.util.spec_from_file_location("config", config_path)
@@ -80,48 +76,14 @@ def load_config(config_file: str = "config.py") -> Dict[str, str]:
         spec.loader.exec_module(config_module)
         cfg = {}
         
-        # OpenAI / Azure OpenAI settings
-        cfg['use_azure'] = getattr(config_module, 'USE_AZURE_OPENAI', False)
-        cfg['openai_api_key'] = getattr(config_module, 'OPENAI_API_KEY', None)
-        cfg['openai_model'] = getattr(config_module, 'OPENAI_MODEL', 'gpt-4o-2024-08-06')
-        cfg['azure_endpoint'] = getattr(config_module, 'AZURE_OPENAI_ENDPOINT', None)
-        cfg['azure_api_key'] = getattr(config_module, 'AZURE_OPENAI_API_KEY', None)
-        cfg['azure_deployment'] = getattr(config_module, 'AZURE_OPENAI_DEPLOYMENT_NAME', None)
-        
         # Processing settings
         cfg['max_chunk_size'] = getattr(config_module, 'MAX_CHUNK_SIZE', 15000)
         cfg['api_delay'] = getattr(config_module, 'API_DELAY', 0.3)
         
         return cfg
     except Exception as e:
-        st.error(f"Error loading config: {e}")
-        return None
-
-
-def setup_openai_client(cfg: Dict[str, str]):
-    """Setup OpenAI client based on configuration"""
-    if not cfg:
-        return None
-    
-    try:
-        if cfg.get('use_azure'):
-            if not all([cfg.get('azure_api_key'), cfg.get('azure_endpoint'), cfg.get('azure_deployment')]):
-                return None
-            
-            client = OpenAI(
-                api_key=cfg['azure_api_key'],
-                base_url=f"{cfg['azure_endpoint'].rstrip('/')}/openai/deployments/{cfg['azure_deployment']}",
-            )
-            return client
-        else:
-            if not cfg.get('openai_api_key'):
-                return None
-            
-            client = OpenAI(api_key=cfg['openai_api_key'])
-            return client
-    except Exception as e:
-        st.error(f"Error setting up OpenAI client: {e}")
-        return None
+        st.warning(f"Could not load config: {e}")
+        return {}
 
 
 # ============================================================================
@@ -182,99 +144,52 @@ def scan_local_pdfs(base_dir: str = "mock_documents") -> List[Dict[str, str]]:
 # LLM-Powered Search Functions
 # ============================================================================
 
-def extract_search_criteria_with_llm(client, model: str, query: str, available_pdfs: List[Dict]) -> Dict:
+def extract_search_criteria(query: str, available_pdfs: List[Dict]) -> Dict:
     """
-    Use LLM to extract search criteria from natural language query
+    Extract search criteria from natural language query using keyword matching
     """
     # Get unique values from available PDFs for context
     unique_accounts = sorted(set(pdf['account'] for pdf in available_pdfs))
     unique_lobs = sorted(set(pdf['lob'] for pdf in available_pdfs))
     
-    prompt = f"""Extract search criteria from the user's natural language query.
-
-Available Accounts: {', '.join(unique_accounts)}
-Available LOBs: {', '.join(unique_lobs)}
-
-User Query: "{query}"
-
-Extract the following information:
-1. LOB (Line of Business): AUTO, PROPERTY, GL, WC, or empty if not specified
-2. Account name: Match to one of the available accounts, or empty if not specified
-3. Policy number: Any numeric identifier mentioned, or empty if not specified
-4. Keywords: Important keywords from the query (e.g., "auto", "vehicle", "claim", etc.)
-
-Return STRICT JSON ONLY with no markdown, no code blocks, no explanation:
-{{
-    "lob": "AUTO|PROPERTY|GL|WC|",
-    "account": "account name or empty string",
-    "policy_number": "policy number or empty string",
-    "keywords": ["keyword1", "keyword2"]
-}}
-
-Examples:
-- Query: "auto" → {{"lob": "AUTO", "account": "", "policy_number": "", "keywords": ["auto"]}}
-- Query: "find WC documents" → {{"lob": "WC", "account": "", "policy_number": "", "keywords": ["WC", "documents"]}}
-- Query: "Chubbs property" → {{"lob": "PROPERTY", "account": "Chubbs", "policy_number": "", "keywords": ["Chubbs", "property"]}}
-- Query: "policy 7890" → {{"lob": "", "account": "", "policy_number": "7890", "keywords": ["policy", "7890"]}}
-"""
+    query_lower = query.lower().strip()
+    criteria = {
+        'lob': '',
+        'account': '',
+        'policy_number': '',
+        'keywords': query_lower.split()
+    }
     
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=300,
-            response_format={"type": "json_object"}
-        )
-        
-        content = resp.choices[0].message.content
-        criteria = json.loads(content)
-        
-        # Normalize LOB
-        if criteria.get('lob'):
-            lob = criteria['lob'].upper().strip()
-            if lob in ['AUTO', 'PROPERTY', 'GL', 'GENERAL LIABILITY', 'WC', 'WORKERS COMP']:
-                if lob == 'GENERAL LIABILITY':
-                    criteria['lob'] = 'GL'
-                elif lob == 'WORKERS COMP':
-                    criteria['lob'] = 'WC'
-                else:
-                    criteria['lob'] = lob
-            else:
-                criteria['lob'] = ''
-        
-        # Normalize account (fuzzy match)
-        if criteria.get('account'):
-            account_query = criteria['account'].lower().strip()
-            for account in unique_accounts:
-                if account_query in account.lower() or account.lower() in account_query:
-                    criteria['account'] = account
-                    break
-        
-        return criteria
+    # LOB detection
+    if any(kw in query_lower for kw in ['auto', 'vehicle', 'car', 'automobile', 'motor']):
+        criteria['lob'] = 'AUTO'
+    elif any(kw in query_lower for kw in ['property', 'dwelling', 'building', 'fire', 'theft']):
+        criteria['lob'] = 'PROPERTY'
+    elif any(kw in query_lower for kw in ['gl', 'general liability', 'liability', 'cgl']):
+        criteria['lob'] = 'GL'
+    elif any(kw in query_lower for kw in ['wc', 'workers comp', 'workers compensation', 'work', 'workers']):
+        criteria['lob'] = 'WC'
     
-    except Exception as e:
-        st.warning(f"LLM search extraction failed: {e}. Using keyword matching instead.")
-        # Fallback: simple keyword matching
-        query_lower = query.lower()
-        criteria = {
-            'lob': '',
-            'account': '',
-            'policy_number': '',
-            'keywords': query_lower.split()
-        }
-        
-        # Simple LOB detection
-        if any(kw in query_lower for kw in ['auto', 'vehicle', 'car', 'automobile']):
-            criteria['lob'] = 'AUTO'
-        elif any(kw in query_lower for kw in ['property', 'dwelling', 'building', 'fire']):
-            criteria['lob'] = 'PROPERTY'
-        elif any(kw in query_lower for kw in ['gl', 'general liability', 'liability']):
-            criteria['lob'] = 'GL'
-        elif any(kw in query_lower for kw in ['wc', 'workers comp', 'workers compensation', 'work']):
-            criteria['lob'] = 'WC'
-        
-        return criteria
+    # Account detection (fuzzy match)
+    for account in unique_accounts:
+        account_lower = account.lower()
+        if account_lower in query_lower or query_lower in account_lower:
+            criteria['account'] = account
+            break
+        # Check for partial matches
+        account_words = account_lower.split()
+        query_words = query_lower.split()
+        if any(word in query_words for word in account_words if len(word) > 3):
+            criteria['account'] = account
+            break
+    
+    # Policy number detection (look for numbers)
+    import re
+    policy_numbers = re.findall(r'\d{4,}', query)
+    if policy_numbers:
+        criteria['policy_number'] = policy_numbers[0]
+    
+    return criteria
 
 
 def filter_pdfs_by_criteria(pdf_files: List[Dict], criteria: Dict) -> List[Dict]:
@@ -627,33 +542,15 @@ def main():
     # Load configuration
     cfg = load_config()
     
-    if not cfg:
-        st.error("❌ Could not load config.py. Please ensure config.py exists and is properly configured.")
-        st.stop()
-    
     # Sidebar - Configuration Status
     st.sidebar.header("⚙️ Configuration")
     
-    if cfg.get('use_azure'):
-        st.sidebar.success("✅ Azure OpenAI Configured")
-        st.sidebar.write(f"**Endpoint:** {cfg.get('azure_endpoint', 'N/A')[:50]}...")
-        st.sidebar.write(f"**Deployment:** {cfg.get('azure_deployment', 'N/A')}")
-    elif cfg.get('openai_api_key'):
-        st.sidebar.success("✅ OpenAI Configured")
-        st.sidebar.write(f"**Model:** {cfg.get('openai_model', 'N/A')}")
+    if cfg:
+        st.sidebar.success("✅ Config loaded")
+        st.sidebar.write(f"**Max Chunk Size:** {cfg.get('max_chunk_size', 15000)}")
+        st.sidebar.write(f"**API Delay:** {cfg.get('api_delay', 0.3)}s")
     else:
-        st.sidebar.error("❌ No API configuration found")
-    
-    st.sidebar.write(f"**Max Chunk Size:** {cfg.get('max_chunk_size', 15000)}")
-    st.sidebar.write(f"**API Delay:** {cfg.get('api_delay', 0.3)}s")
-    
-    # Setup OpenAI client
-    client = setup_openai_client(cfg)
-    if not client:
-        st.error("❌ Failed to setup OpenAI client. Check your configuration.")
-        st.stop()
-    
-    model = cfg.get('azure_deployment') if cfg.get('use_azure') else cfg.get('openai_model', 'gpt-4o-2024-08-06')
+        st.sidebar.info("ℹ️ Using default settings")
     
     # ========================================================================
     # Section 1: Search Documents using LLM
@@ -693,9 +590,9 @@ def main():
         if st.button("🔎 Search", type="primary") or st.session_state.get('search_query') != search_query:
             st.session_state['search_query'] = search_query
             
-            with st.spinner("🤖 Analyzing search query with AI..."):
-                # Use LLM to extract search criteria
-                search_criteria = extract_search_criteria_with_llm(client, model, search_query, all_pdf_files)
+            with st.spinner("🔍 Analyzing search query..."):
+                # Extract search criteria using keyword matching
+                search_criteria = extract_search_criteria(search_query, all_pdf_files)
                 
                 # Filter PDFs based on criteria
                 filtered_pdfs = filter_pdfs_by_criteria(all_pdf_files, search_criteria)
@@ -732,7 +629,7 @@ def main():
                 all_pdf_files = st.session_state['pdf_files']
                 # Re-apply search if active
                 if search_query:
-                    search_criteria = extract_search_criteria_with_llm(client, model, search_query, all_pdf_files)
+                    search_criteria = extract_search_criteria(search_query, all_pdf_files)
                     filtered_pdfs = filter_pdfs_by_criteria(all_pdf_files, search_criteria)
                     st.session_state['filtered_pdfs'] = filtered_pdfs
                 else:
@@ -883,25 +780,25 @@ def main():
                         st.text(f"[SUCCESS] Text file created: {text_file_path}")
                         st.text(f"Time taken: {format_time(ocr_time)}")
                     
-                    # Step 2: Process with OpenAI
-                    status_text.text("Step 2/3: Processing text with OpenAI...")
+                    # Step 2: Process with text_lob_openai_extractor.py (external script)
+                    status_text.text("Step 2/3: Processing text with extraction script...")
                     progress_bar.progress(0.6)
                     
                     if st.session_state.debug_mode:
-                        st.markdown("**📋 Real-time Debug Logs (OpenAI Extraction):**")
-                        debug_placeholder_openai = st.empty()
+                        st.markdown("**📋 Real-time Debug Logs (Extraction):**")
+                        debug_placeholder_extract = st.empty()
                     else:
-                        debug_placeholder_openai = None
+                        debug_placeholder_extract = None
                     
-                    start_openai = time.time()
+                    start_extract = time.time()
                     result_file_path, error = process_text_with_openai(
                         text_file_path,
                         results_dir,
                         selected_pdf['filename'],
-                        debug_placeholder_openai
+                        debug_placeholder_extract
                     )
-                    openai_time = time.time() - start_openai
-                    st.session_state.processing_times['OpenAI Extraction'] = openai_time
+                    extract_time = time.time() - start_extract
+                    st.session_state.processing_times['Extraction'] = extract_time
                     
                     if not result_file_path:
                         st.session_state.processing_status = "Error"
@@ -1079,9 +976,9 @@ def main():
     st.sidebar.write("""
     This app:
     1. Scans local file structure for PDFs
-    2. Uses config.py for Azure OpenAI settings
-    3. Processes selected PDFs with AI
-    4. Sends extracted data via email
+    2. Uses config.py for processing settings
+    3. Processes selected PDFs using external scripts
+    4. Sends extracted data via email with CSV-based LOB mapping
     """)
     
     if st.sidebar.button("🔄 Reset Session"):
