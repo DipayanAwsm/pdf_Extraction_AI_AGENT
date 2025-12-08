@@ -76,6 +76,14 @@ def load_config(config_file: str = "config.py") -> Dict[str, str]:
         spec.loader.exec_module(config_module)
         cfg = {}
         
+        # OpenAI / Azure OpenAI settings (for external scripts)
+        cfg['use_azure'] = getattr(config_module, 'USE_AZURE_OPENAI', False)
+        cfg['openai_api_key'] = getattr(config_module, 'OPENAI_API_KEY', None)
+        cfg['openai_model'] = getattr(config_module, 'OPENAI_MODEL', 'gpt-4o-2024-08-06')
+        cfg['azure_endpoint'] = getattr(config_module, 'AZURE_OPENAI_ENDPOINT', None)
+        cfg['azure_api_key'] = getattr(config_module, 'AZURE_OPENAI_API_KEY', None)
+        cfg['azure_deployment'] = getattr(config_module, 'AZURE_OPENAI_DEPLOYMENT_NAME', None)
+        
         # Processing settings
         cfg['max_chunk_size'] = getattr(config_module, 'MAX_CHUNK_SIZE', 15000)
         cfg['api_delay'] = getattr(config_module, 'API_DELAY', 0.3)
@@ -84,6 +92,33 @@ def load_config(config_file: str = "config.py") -> Dict[str, str]:
     except Exception as e:
         st.warning(f"Could not load config: {e}")
         return {}
+
+
+def print_llm_details(cfg: Dict[str, str], context: str = ""):
+    """
+    Print LLM configuration details whenever LLM is called
+    """
+    print("\n" + "="*60)
+    print(f"🤖 LLM CALL DETAILS {context}")
+    print("="*60)
+    
+    if cfg.get('use_azure'):
+        print(f"✅ Provider: Azure OpenAI")
+        print(f"📍 Endpoint: {cfg.get('azure_endpoint', 'N/A')}")
+        print(f"🔑 API Key: {cfg.get('azure_api_key', 'N/A')[:20]}..." if cfg.get('azure_api_key') else "🔑 API Key: Not set")
+        print(f"📦 Deployment: {cfg.get('azure_deployment', 'N/A')}")
+        print(f"🌐 Full URL: {cfg.get('azure_endpoint', '').rstrip('/')}/openai/deployments/{cfg.get('azure_deployment', 'N/A')}")
+    elif cfg.get('openai_api_key'):
+        print(f"✅ Provider: OpenAI")
+        print(f"🔑 API Key: {cfg.get('openai_api_key', 'N/A')[:20]}..." if cfg.get('openai_api_key') else "🔑 API Key: Not set")
+        print(f"🤖 Model: {cfg.get('openai_model', 'N/A')}")
+        print(f"🌐 Base URL: https://api.openai.com/v1")
+    else:
+        print(f"⚠️ No LLM configuration found")
+    
+    print(f"⚙️ Max Chunk Size: {cfg.get('max_chunk_size', 15000)}")
+    print(f"⏱️ API Delay: {cfg.get('api_delay', 0.3)}s")
+    print("="*60 + "\n")
 
 
 # ============================================================================
@@ -314,9 +349,22 @@ def convert_pdf_to_text(pdf_path, tmp_dir, debug_log_container=None):
         return None, str(e)
 
 
-def process_text_with_openai(text_file_path, results_dir, original_pdf_name, debug_log_container=None):
+def process_text_with_openai(text_file_path, results_dir, original_pdf_name, debug_log_container=None, cfg: Dict = None):
     """Process text file using text_lob_openai_extractor.py"""
     try:
+        # Print LLM details before processing
+        if cfg:
+            print_llm_details(cfg, f"- Processing: {original_pdf_name}")
+            if debug_log_container:
+                debug_log_container.info("🤖 LLM Configuration:")
+                if cfg.get('use_azure'):
+                    debug_log_container.write(f"  Provider: Azure OpenAI")
+                    debug_log_container.write(f"  Endpoint: {cfg.get('azure_endpoint', 'N/A')}")
+                    debug_log_container.write(f"  Deployment: {cfg.get('azure_deployment', 'N/A')}")
+                elif cfg.get('openai_api_key'):
+                    debug_log_container.write(f"  Provider: OpenAI")
+                    debug_log_container.write(f"  Model: {cfg.get('openai_model', 'N/A')}")
+        
         # Create timestamped output directory with original filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         original_name_no_ext = Path(original_pdf_name).stem
@@ -542,11 +590,30 @@ def main():
     # Load configuration
     cfg = load_config()
     
+    # Print LLM details on app startup
+    if cfg:
+        print_llm_details(cfg, "- App Startup")
+    
     # Sidebar - Configuration Status
     st.sidebar.header("⚙️ Configuration")
     
     if cfg:
         st.sidebar.success("✅ Config loaded")
+        
+        # Show LLM configuration in sidebar
+        with st.sidebar.expander("🤖 LLM Configuration", expanded=False):
+            if cfg.get('use_azure'):
+                st.write(f"**Provider:** Azure OpenAI")
+                st.write(f"**Endpoint:** {cfg.get('azure_endpoint', 'N/A')[:50]}...")
+                st.write(f"**Deployment:** {cfg.get('azure_deployment', 'N/A')}")
+                st.write(f"**API Key:** {'✅ Set' if cfg.get('azure_api_key') else '❌ Not set'}")
+            elif cfg.get('openai_api_key'):
+                st.write(f"**Provider:** OpenAI")
+                st.write(f"**Model:** {cfg.get('openai_model', 'N/A')}")
+                st.write(f"**API Key:** {'✅ Set' if cfg.get('openai_api_key') else '❌ Not set'}")
+            else:
+                st.warning("⚠️ No LLM configuration found")
+        
         st.sidebar.write(f"**Max Chunk Size:** {cfg.get('max_chunk_size', 15000)}")
         st.sidebar.write(f"**API Delay:** {cfg.get('api_delay', 0.3)}s")
     else:
@@ -795,7 +862,8 @@ def main():
                         text_file_path,
                         results_dir,
                         selected_pdf['filename'],
-                        debug_placeholder_extract
+                        debug_placeholder_extract,
+                        cfg  # Pass config to print LLM details
                     )
                     extract_time = time.time() - start_extract
                     st.session_state.processing_times['Extraction'] = extract_time
